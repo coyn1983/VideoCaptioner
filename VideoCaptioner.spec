@@ -1,5 +1,17 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""PyInstaller build recipe for the VideoCaptioner desktop bundle."""
+"""PyInstaller build recipe for the VideoCaptioner desktop bundle.
+
+Produces two executables that share one `_internal` payload:
+
+* ``VideoCaptioner.exe``     -- console build, drives the CLI (and the GUI when
+  launched without arguments).
+* ``VideoCaptioner-GUI.exe`` -- windowed build, so double-clicking shows the
+  desktop app without a stray console window.
+
+Both are optional-free: the icon / version resource are picked up from
+``installer/`` when present (see ``installer/build_installer.py --prep``) and
+silently skipped otherwise, so a plain checkout still builds.
+"""
 
 import os
 import sys
@@ -16,6 +28,15 @@ RUNTIME_DIR = Path(os.environ.get("VIDEOCAPTIONER_DESKTOP_RUNTIME_DIR", ROOT / "
 def _data(src: Path, dest: str):
     return (str(src), dest)
 
+
+def _optional(path: Path):
+    """Return str(path) when the file exists, else None (PyInstaller treats None as unset)."""
+    return str(path) if path.exists() else None
+
+
+ICON_FILE = _optional(ROOT / "installer" / "VideoCaptioner.ico")
+VERSION_INFO_CLI = _optional(ROOT / "installer" / "version_info_cli.txt")
+VERSION_INFO_GUI = _optional(ROOT / "installer" / "version_info_gui.txt")
 
 datas = [
     _data(ROOT / "resource" / "assets", "resource/assets"),
@@ -105,10 +126,37 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=ICON_FILE,
+    version=VERSION_INFO_CLI,
 )
 
+collected_exes = [exe]
+
+# Windowed launcher: no console window when the desktop app is opened directly.
+if sys.platform == "win32":
+    gui_exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        name="VideoCaptioner-GUI",
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=True,
+        console=False,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+        icon=ICON_FILE,
+        version=VERSION_INFO_GUI,
+    )
+    collected_exes.append(gui_exe)
+
 coll = COLLECT(
-    exe,
+    *collected_exes,
     a.binaries,
     a.zipfiles,
     a.datas,

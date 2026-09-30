@@ -24,12 +24,16 @@ def main():
     from videocaptioner.ui.common.config import cfg
     from videocaptioner.ui.view.main_window import MainWindow
 
-    # Qt platform plugin path
+    # Qt platform plugin path.
+    # Only point Qt at the venv-local plugins when they actually exist: frozen
+    # bundles ship the plugins under `_internal` and install their own runtime
+    # hooks, so overriding the variable with a non-existent path breaks startup.
     lib_folder = "Lib" if platform.system() == "Windows" else "lib"
     plugin_path = os.path.join(
         sys.prefix, lib_folder, "site-packages", "PyQt5", "Qt5", "plugins"
     )
-    os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
+    if os.path.isdir(plugin_path):
+        os.environ["QT_QPA_PLATFORM_PLUGIN_PATH"] = plugin_path
 
     # Logger + global exception hook
     logger = setup_logger("VideoCaptioner")
