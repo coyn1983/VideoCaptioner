@@ -228,14 +228,25 @@ def _get_video_resolution(video_path: str) -> Tuple[int, int]:
         ["ffmpeg", "-i", video_path],
         capture_output=True,
         text=True,
+        # ffmpeg 会把输入文件名等按 UTF-8 写入 stderr。若按系统 ANSI 代码页
+        # （中文 Windows 即 GBK）解码会抛 UnicodeDecodeError，而该异常发生在
+        # subprocess 的读取线程里并被静默吞掉，最终表现为 result.stderr is None，
+        # 上层报 "expected string or bytes-like object, got 'NoneType'"。
+        # 显式指定 UTF-8 + errors="replace" 可避免，与 rounded_renderer 保持一致。
+        encoding="utf-8",
+        errors="replace",
         creationflags=(
             getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         ),
     )
 
     # 从 ffmpeg 输出中解析分辨率
-    pattern = r"(\d{2,5})x(\d{2,5})"
-    match = re.search(pattern, result.stderr)
+    # 优先匹配视频流所在行，避免误抓其它 "数字x数字"；部分封装格式的流信息
+    # 行会折行导致严格模式失配，此时退回宽松匹配。
+    stderr = result.stderr or ""
+    match = re.search(r"Stream.*Video:.* (\d{2,5})x(\d{2,5})", stderr) or re.search(
+        r"(\d{2,5})x(\d{2,5})", stderr
+    )
     if match:
         return int(match.group(1)), int(match.group(2))
     return 1920, 1080  # 默认返回 1080P

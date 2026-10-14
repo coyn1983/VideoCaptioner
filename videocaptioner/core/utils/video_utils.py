@@ -136,6 +136,8 @@ def check_cuda_available() -> bool:
             ["ffmpeg", "-hwaccels"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             creationflags=(
                 getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             ),
@@ -149,6 +151,8 @@ def check_cuda_available() -> bool:
             ["ffmpeg", "-hide_banner", "-init_hw_device", "cuda"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             creationflags=(
                 getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             ),

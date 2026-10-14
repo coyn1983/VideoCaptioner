@@ -154,6 +154,15 @@ def _video_has_audio(video_path: str) -> bool:
         "json",
         video_path,
     ]
-    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    # ffprobe 会把文件路径/标签按 UTF-8 输出；显式指定编码，避免在中文 Windows
+    # （GBK 代码页）下解码失败导致 stdout 变成 None。
+    result = subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     data = json.loads(result.stdout or "{}")
     return bool(data.get("streams"))
