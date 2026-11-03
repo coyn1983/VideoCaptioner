@@ -49,6 +49,93 @@ def _get_video_info(video_path: str) -> Tuple[int, int, float]:
 
     return width, height, duration
 
+CHUNK_SIZE = 50
+
+
+def _run_ffmpeg(args):
+    """执行 ffmpeg，失败时抛出带 stderr 的异常。"""
+    result = subprocess.run(
+        ["ffmpeg", *args],
+        capture_output=True,
+        text=True,
+        # ffmpeg 会按 UTF-8 输出文件名等；显式指定编码，避免中文 Windows（GBK）
+        # 下解码失败导致 stderr 变成 None（与 _get_video_info 同源问题）。
+        encoding="utf-8",
+        errors="replace",
+        creationflags=(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        ),
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "FFmpeg failed: ffmpeg "
+            + " ".join(args[:12])
+            + "\n\n"
+            + (result.stderr or "")[-4000:]
+        )
+
+
+def _get_audio_codec(video_path: str) -> str:
+    """返回音轨编码名（无音轨时返回空串）。"""
+    result = subprocess.run(
+        ["ffmpeg", "-i", video_path],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=(
+            getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        ),
+    )
+    match = re.search(r"Audio:\s*([A-Za-z0-9_]+)", result.stderr or "")
+    return match.group(1).lower() if match else ""
+
+
+def _plan_chunks(frames, duration: float, chunk_size: int):
+    """把时间轴切成互不重叠、首尾相接的连续区间。
+
+    切点只落在字幕之间的空档里，保证没有任何一条字幕被切成两半。
+    返回 [(chunk_start, chunk_end, [(start, end, png_path), ...]), ...]，
+    这些区间合起来正好覆盖 [0, duration]，因此拼接后与源视频等长。
+    """
+    chunks = []
+    total = len(frames)
+    idx = 0
+    cur_start = 0.0
+
+    while idx < total:
+        last = min(idx + chunk_size - 1, total - 1)
+
+        if last == total - 1:
+            chunks.append((cur_start, duration, frames[idx:]))
+            break
+
+        boundary = None
+        probe = last
+        # 相邻字幕若有重叠，该处不能切分，向后顺延找下一个空档
+        while probe < total - 1:
+            gap_start = frames[probe][1]
+            gap_end = frames[probe + 1][0]
+            candidate = (
+                (gap_start + gap_end) / 2.0 if gap_end > gap_start else gap_start
+            )
+            if candidate > cur_start:
+                boundary = candidate
+                last = probe
+                break
+            probe += 1
+
+        if boundary is None:
+            chunks.append((cur_start, duration, frames[idx:]))
+            break
+
+        chunks.append((cur_start, boundary, frames[idx : last + 1]))
+        cur_start = boundary
+        idx = last + 1
+
+    return chunks
+
+
 
 def render_text_block(
     draw: ImageDraw.ImageDraw,
@@ -277,10 +364,17 @@ def render_rounded_video(
     reference_height: int = 720,
 ) -> None:
     """
-    渲染圆角背景字幕到视频（分批overlay方案）
+    渲染圆角背景字幕到视频（时间分段编码方案）
 
-    核心流程: 直接分批overlay字幕PNG到原视频
-    每批50个字幕，避免FFmpeg文件数量限制
+    核心流程:
+    1. 每条字幕渲染成一张透明 PNG
+    2. 把时间轴切成首尾相接的连续区间（切点只落在字幕空档），每段只编码这一段、
+       只叠加该段的字幕图，所有分段共用同一组编码参数
+    3. 用 concat 无损拼接所有分段
+    4. 挂回原始音轨（直接 copy）
+
+    这样整部视频只完整编码一遍。旧实现是「每批都把整部视频重编码一遍」，代价是
+    O(批次数 × 视频时长)，长视频下既极慢又会撑爆临时空间。
 
     Args:
         video_path: 输入视频路径
@@ -371,92 +465,155 @@ def render_rounded_video(
         if not subtitle_frames:
             raise ValueError("No valid subtitle images generated")
 
-        # 步骤2: 分批overlay到视频 (30-100%)
-        logger.debug("Overlaying subtitle batches onto video")
-        BATCH_SIZE = 50
-        current_video = video_path
-        total_batches = (len(subtitle_frames) + BATCH_SIZE - 1) // BATCH_SIZE
+        # 步骤2: 按时间区间分段编码 (30-95%)
+        #
+        # 旧实现是「每批都把整部视频重编码一遍」：代价是 O(批次数 × 视频时长)，而且
+        # 中间批次用 crf 0 会让每个中间文件膨胀到十几 GB。实测 4.7 小时 / 1394 条字幕
+        # → 28 批，单批已写出 13 GB，全流程需要约 364 GB 临时空间，普通磁盘必然爆盘。
+        #
+        # 现在改为：把时间轴切成首尾相接的连续区间，每段只编码这一段、只叠加属于该段的
+        # 字幕图，最后用 concat 无损拼接。整部视频只完整编码一遍。
+        logger.debug("Encoding time-segmented chunks")
 
-        for batch_idx in range(total_batches):
-            start_idx = batch_idx * BATCH_SIZE
-            end_idx = min((batch_idx + 1) * BATCH_SIZE, len(subtitle_frames))
-            batch_frames = subtitle_frames[start_idx:end_idx]
+        ordered_frames = sorted(subtitle_frames, key=lambda f: f[0])
+        chunks = _plan_chunks(ordered_frames, video_duration, CHUNK_SIZE)
+        total_chunks = len(chunks)
+        logger.debug(f"Split timeline into {total_chunks} segments")
 
-            # 构建overlay滤镜链
-            input_args = ["-i", current_video]
+        chunk_files: List[Path] = []
+        for chunk_idx, (chunk_start, chunk_end, frames) in enumerate(chunks):
+            span = chunk_end - chunk_start
+            if span <= 0.02:
+                continue
+
+            input_args = [
+                "-ss",
+                f"{chunk_start:.3f}",
+                "-t",
+                f"{span:.3f}",
+                "-i",
+                video_path,
+            ]
             filter_parts = []
 
-            for local_idx, (start, end, png_path) in enumerate(batch_frames):
+            for local_idx, (start, end, png_path) in enumerate(frames):
                 input_args.extend(["-i", str(png_path)])
-                prev = f"[v{local_idx}]" if local_idx > 0 else "[0:v]"
+                # 输入已用 -ss 重新定位，时间戳从 0 开始，字幕时间要减去段起点
+                local_start = max(0.0, start - chunk_start)
+                local_end = min(span, end - chunk_start)
+                if local_end <= local_start:
+                    continue
+                prev = f"[v{local_idx - 1}]" if local_idx > 0 else "[0:v]"
                 curr = f"[{local_idx + 1}:v]"
-                out = f"[v{local_idx + 1}]"
+                out = f"[v{local_idx}]"
                 filter_parts.append(
-                    f"{prev}{curr}overlay=0:0:enable='between(t,{start},{end})'{out}"
+                    f"{prev}{curr}overlay=0:0:"
+                    f"enable='between(t,{local_start:.3f},{local_end:.3f})'{out}"
                 )
 
-            filter_complex = ";".join(filter_parts)
-            final_output = f"[v{len(batch_frames)}]"
+            if not filter_parts:
+                filter_parts.append("[0:v]null[v0]")
 
-            # 判断是否是最后一批
-            is_last_batch = batch_idx == total_batches - 1
-            batch_output = (
-                output_path if is_last_batch else temp_path / f"batch_{batch_idx:03d}.mp4"
+            chunk_file = temp_path / f"chunk_{chunk_idx:04d}.mp4"
+            logger.debug(
+                f"Segment {chunk_idx + 1}/{total_chunks}"
+                f"（{chunk_start:.0f}s-{chunk_end:.0f}s，{len(frames)} 条字幕）"
             )
 
-            logger.debug(f"Processing batch {batch_idx + 1}/{total_batches}（{len(batch_frames)}个字幕）")
-            # 构建 ffmpeg Command
-            # -t 参数强制保持原视频时长，防止因 overlay ended而截断视频
-            cmd = [
-                "ffmpeg",
-                "-y",
-                *input_args,
-                "-filter_complex",
-                filter_complex,
-                "-map",
-                final_output,
-                "-map",
-                "0:a?",
-                "-t",
-                str(video_duration),  # 强制保持原视频时长
-                "-c:v",
-                "libx264",
-                "-preset",
-                "ultrafast" if not is_last_batch else preset,
-                "-crf",
-                "0" if not is_last_batch else str(crf),
-                "-pix_fmt",
-                "yuv420p",
-                "-c:a",
-                "copy",
-                str(batch_output),
-            ]
-
-            if batch_idx == 0 or is_last_batch:
-                cmd_str = subprocess.list2cmdline(cmd)
-                logger.debug(f"FFmpeg cmd: {cmd_str}")
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=(
-                    getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
-                ),
+            # 所有分段必须使用完全相同的编码参数，否则 concat 无法用 -c copy 直接拼接
+            _run_ffmpeg(
+                [
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    *input_args,
+                    "-filter_complex",
+                    ";".join(filter_parts),
+                    "-map",
+                    f"[v{len(filter_parts) - 1}]",
+                    "-an",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    preset,
+                    "-crf",
+                    str(crf),
+                    "-pix_fmt",
+                    "yuv420p",
+                    str(chunk_file),
+                ]
             )
+            chunk_files.append(chunk_file)
 
-            if result.returncode != 0:
-                logger.error(f"批次 {batch_idx + 1} 失败: {result.stderr}")
-                raise RuntimeError(f"Subtitle processing failed（批次 {batch_idx + 1}）")
-
-            # 更新进度 (30-100%)
             if progress_callback:
-                progress = 30 + int((batch_idx + 1) / total_batches * 70)
-                progress_callback(progress, f"合成视频 {batch_idx + 1}/{total_batches}")
+                progress = 30 + int((chunk_idx + 1) / total_chunks * 65)
+                progress_callback(progress, f"合成视频 {chunk_idx + 1}/{total_chunks}")
 
-            # 更新当前视频
-            current_video = str(batch_output)
+        if not chunk_files:
+            raise ValueError("No video chunk generated")
+
+        # 步骤3: 无损拼接所有分段 (95-97%)
+        logger.debug("Concatenating segments")
+        concat_list = temp_path / "concat.txt"
+        concat_list.write_text(
+            "\n".join(f"file '{item.as_posix()}'" for item in chunk_files),
+            encoding="utf-8",
+        )
+        merged_video = temp_path / "merged.mp4"
+        _run_ffmpeg(
+            [
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                str(concat_list),
+                "-c",
+                "copy",
+                str(merged_video),
+            ]
+        )
+        if progress_callback:
+            progress_callback(97, "合并分段...")
+
+        # 步骤4: 挂回原始音轨 (97-100%)
+        # 分段编码时用 -an 丢掉音频，最后直接 copy 原音轨：省掉 N 次音频重编码，
+        # 也避免了每段 AAC 的 priming samples 造成累计偏移。
+        audio_codec = _get_audio_codec(video_path)
+        audio_args = ["-c:a", "copy"]
+        if audio_codec in {"opus", "vorbis"}:
+            # mp4 容器里放 opus/vorbis 兼容性差，转成 AAC
+            audio_args = ["-c:a", "aac", "-b:a", "192k"]
+
+        _run_ffmpeg(
+            [
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(merged_video),
+                "-i",
+                video_path,
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a?",
+                "-c:v",
+                "copy",
+                *audio_args,
+                "-t",
+                f"{video_duration:.3f}",
+                str(output_path),
+            ]
+        )
+
+        if progress_callback:
+            progress_callback(100, "合成完成")
 
         logger.debug("Video synthesis complete")
